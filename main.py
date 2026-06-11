@@ -12,6 +12,18 @@
 # ─────────────────────────────────────────────────────────────
 
 import os
+import sys
+
+# Ensure UTF-8 console output so the box-drawing / em-dash characters used
+# throughout the menus render on Windows (default cp1252 raises
+# UnicodeEncodeError). Harmless on macOS/Linux, which are already UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # Force Python's requests library to bypass any environment adapters for AT
 os.environ['no_proxy'] = 'api.sandbox.africastalking.com,sandbox.africastalking.com,africastalking.com'
 from modules.database import create_tables, add_user, add_tip, get_send_stats
@@ -62,7 +74,7 @@ def seed_database():
 
     # Register sample test users
     
-    add_user("Charmaine Lawrence",   "+260776016313", language="English",  area="Lusaka")
+    add_user("Test User",   "+260900000000", language="English",  area="Lusaka")
    
 
     

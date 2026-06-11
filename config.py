@@ -33,3 +33,14 @@ WARNING_CHECK_MINUTE = 0
 
 # ── TEST MODE ────────────────────────────────────────────────
 TEST_MODE = os.getenv("TEST_MODE", "True") == "True"
+
+# ── EMULATOR TEST DELIVERY ───────────────────────────────────
+# When TEST_MODE=True, where to deliver: "console" (print only)
+# or "emulator" (inject into a running Android emulator's inbox).
+TEST_TARGET        = os.getenv("TEST_TARGET", "console")
+# "emu" = adb emu sms send (AVD, reliable) | "content" = content insert (Genymotion, legacy)
+EMULATOR_METHOD    = os.getenv("EMULATOR_METHOD", "emu")
+# Sender label shown on the emulated handset. Keep NUMERIC for the "emu" method.
+EMULATOR_SENDER_ID = os.getenv("EMULATOR_SENDER_ID", "0972000000")
+# Leave blank to use adb from PATH; else full path to adb(.exe).
+ADB_PATH           = os.getenv("ADB_PATH", "")

@@ -2,3 +2,12 @@ africastalking>=1.0.0
 twilio>=8.0.0
 apscheduler>=3.10.0
 requests>=2.31.0
+python-dotenv>=1.0.0
+cryptography>=42.0.0
+
+# Optional — only needed for Tier-2 NLLB-200 machine translation.
+# These pull ~2.4 GB. The system runs fine without them (it falls back to
+# pre-written translations, then a glossary, then English). Leave commented
+# unless the user asks for live ML translation.
+# transformers>=4.38.0
+# torch>=2.2.0

@@ -5,7 +5,7 @@
 # Provider is selected via SMS_PROVIDER in config.py.
 # ─────────────────────────────────────────────────────────────
 
-from config import SMS_PROVIDER, TEST_MODE
+from config import SMS_PROVIDER, TEST_MODE, TEST_TARGET
 from config import AT_USERNAME, AT_API_KEY
 from config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
 
@@ -21,6 +21,14 @@ def send_sms(to_number: str, message: str, message_type: str = "awareness") -> d
         print("=" * 65)
         print(f"  [TEST MODE — {tag}]  To: {to_number}")
         print(f"  {message}")
+        if TEST_TARGET.lower() == "emulator":
+            try:
+                from modules.emulator_sender import send_to_emulator
+            except ImportError:
+                from emulator_sender import send_to_emulator
+            r = send_to_emulator(to_number, message)
+            status = "delivered" if r["success"] else "NOT delivered"
+            print(f"  [Emulator] {status}: {r['detail']}")
         print("=" * 65)
         return {"success": True, "sid": "TEST"}
 

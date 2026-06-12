@@ -1,9 +1,9 @@
-# admin_gui.py
+# admingui.py
 # ─────────────────────────────────────────────────────────────
 # ADMIN GUI — Graphical User Interface for System Operator
 #
 # Built with Tkinter (built into Python — no install needed)
-# Run with: py -3.11 admin_gui.py
+# Run with: python admingui.py
 #
 # Features:
 #   - Dashboard showing system status
@@ -18,6 +18,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
+import queue
 import datetime
 import sys
 import os
@@ -30,8 +31,9 @@ from modules.database import (
     add_alert, get_active_alerts, list_all_alerts,
     resolve_alert, get_send_stats, get_next_tip
 )
-from modules.broadcaster import broadcast_alerts, broadcast_awareness
-from config import TEST_MODE, SMS_PROVIDER
+from modules.broadcaster import broadcast_alerts, broadcast_awareness, daily_broadcast
+from modules.sms_sender import validate_phone
+from config import TEST_MODE, SMS_PROVIDER, TEST_TARGET
 
 # ── COLOURS ───────────────────────────────────────────────────
 BG_MAIN    = "#1C2B3A"   # dark navy background
@@ -59,10 +61,31 @@ class AdminGUI:
         # Initialise database
         create_tables()
 
+        # Worker threads hand UI updates back to the main thread through this
+        # queue; Tkinter is not thread-safe, so widgets are only ever touched
+        # by the poller below, which runs on the main (event-loop) thread.
+        self._ui_queue = queue.Queue()
+        self._poll_ui_queue()
+
         # Build UI
         self._build_header()
         self._build_layout()
         self._show_dashboard()
+
+    # ── THREAD-SAFE UI BRIDGE ──────────────────────────────────
+    def _ui(self, fn):
+        """Schedule `fn` to run on the main thread. Safe to call from workers."""
+        self._ui_queue.put(fn)
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        self.root.after(100, self._poll_ui_queue)
 
     # ── HEADER ─────────────────────────────────────────────────
     def _build_header(self):
@@ -76,7 +99,10 @@ class AdminGUI:
                  ).pack(side="left", padx=10, pady=15)
 
         mode_color = RED if not TEST_MODE else GREEN
-        mode_text  = f"  LIVE MODE  " if not TEST_MODE else "  TEST MODE  "
+        if TEST_MODE:
+            mode_text = f"  TEST MODE → {TEST_TARGET.upper()}  "
+        else:
+            mode_text = "  LIVE MODE  "
         tk.Label(header, text=mode_text, font=(FONT, 10, "bold"),
                  fg=WHITE, bg=mode_color).pack(side="right", padx=20, pady=15)
 
@@ -125,7 +151,7 @@ class AdminGUI:
 
         # Version info at bottom of sidebar
         tk.Label(self.sidebar,
-                 text="ZCAS University\nCharmaine Lawrence\n202201770",
+                 text="ZCAS University\nSCEWAS Admin Panel\nv1.0",
                  font=(FONT, 8), fg=DGRAY, bg=BG_SIDEBAR,
                  justify="center").pack(side="bottom", pady=20)
 
@@ -158,9 +184,15 @@ class AdminGUI:
                  font=(FONT, 11, "bold"), fg=GOLD, bg=BG_MAIN
                  ).pack(anchor="w", padx=25, pady=(15, 5))
 
-    def _log(self, widget, message, color=WHITE):
+    def _log(self, widget, message, color=None):
         widget.config(state="normal")
-        widget.insert("end", f"[{datetime.datetime.now().strftime('%H:%M:%S')}]  {message}\n")
+        line = f"[{datetime.datetime.now().strftime('%H:%M:%S')}]  {message}\n"
+        if color:
+            tag = "c" + color.lstrip("#")
+            widget.tag_config(tag, foreground=color)
+            widget.insert("end", line, tag)
+        else:
+            widget.insert("end", line)
         widget.see("end")
         widget.config(state="disabled")
 
@@ -324,21 +356,44 @@ class AdminGUI:
                           bg=BG_CARD, fg=GREEN)
         status.pack(pady=5)
 
+        def _value(label, placeholder):
+            """Return the typed value, treating leftover placeholder text as empty."""
+            v = entries[label].get().strip()
+            return "" if v == placeholder else v
+
         def register():
-            name  = entries["Full Name"].get().strip()
-            phone = entries["Phone Number"].get().strip()
-            area  = entries["Area / District"].get().strip()
+            name  = _value("Full Name",       "e.g. Bwalya Mutale")
+            phone = _value("Phone Number",     "e.g. +260977123456")
+            area  = _value("Area / District",  "e.g. Lusaka")
             lang  = lang_var.get()
 
-            if not name or name == "e.g. Bwalya Mutale":
+            if not name:
                 status.config(text="Please enter a name.", fg=RED)
                 return
-            if not phone.startswith("+"):
-                status.config(text="Phone must start with + (e.g. +260977123456)", fg=RED)
+            if not validate_phone(phone):
+                status.config(
+                    text="Enter a valid phone — '+' followed by 10–15 digits (e.g. +260977123456).",
+                    fg=RED)
+                return
+            if any(u.get("phone") == phone for u in get_active_users()):
+                status.config(text=f"{phone} is already registered.", fg=RED)
                 return
 
-            add_user(name, phone, lang, area if area != "e.g. Lusaka" else "Lusaka")
+            try:
+                add_user(name, phone, lang, area or "Unknown")
+            except Exception as e:
+                status.config(text=f"Registration failed: {e}", fg=RED)
+                return
+
             status.config(text=f"✓  {name} registered successfully!", fg=GREEN)
+
+            # Reset the form so the operator can add another participant.
+            for lbl, ph in fields:
+                en = entries[lbl]
+                en.delete(0, "end")
+                en.insert(0, ph)
+                en.config(fg=DGRAY)
+            lang_var.set("english")
 
         tk.Button(form, text="  Register Participant  ",
                   font=(FONT, 11, "bold"), fg=WHITE, bg=PURPLE,
@@ -488,16 +543,32 @@ class AdminGUI:
                 status.config(text="Alert message cannot be empty.", fg=RED)
                 return
 
+            if len(english) > 160 and not messagebox.askyesno(
+                    "Message exceeds 160 characters",
+                    f"This message is {len(english)} characters and will be sent as "
+                    f"multiple SMS parts. Send anyway?"):
+                return
+
             if not messagebox.askyesno("Confirm Broadcast",
                                        f"Broadcast this {sev_var.get()} alert immediately to all participants?"):
                 return
 
-            add_alert(cat_var.get(), english, bemba, nyanja, sev_var.get())
+            try:
+                add_alert(cat_var.get(), english, bemba, nyanja, sev_var.get())
+            except Exception as e:
+                status.config(text=f"Failed to create alert: {e}", fg=RED)
+                return
+
             status.config(text="✓  Alert created. Broadcasting now...", fg=GREEN)
 
             def broadcast():
-                broadcast_alerts()
-                status.config(text="✓  Alert broadcast complete!", fg=GREEN)
+                try:
+                    broadcast_alerts()
+                    msg, color = "✓  Alert broadcast complete!", GREEN
+                except Exception as e:
+                    msg, color = f"Broadcast error: {e}", RED
+                # Tkinter is not thread-safe — marshal the update to the main thread.
+                self._ui(lambda: status.config(text=msg, fg=color))
 
             threading.Thread(target=broadcast, daemon=True).start()
 
@@ -509,7 +580,7 @@ class AdminGUI:
     # ══════════════════════════════════════════════════════════
     #  SEND BLAST
     # ══════════════════════════════════════════════════════════
-    def _show_send(self):
+    def _show_send(self, auto=None):
         self._clear()
         self._page_title("Send Broadcast",
                          "Manually trigger message delivery")
@@ -519,46 +590,64 @@ class AdminGUI:
             font=("Courier New", 9), state="disabled", relief="flat"
         )
         log.pack(fill="x", padx=25, pady=10)
+        self._send_log = log
         self._log(log, "Ready. Click a button below to send.")
 
         btn_frame = tk.Frame(self.content, bg=BG_MAIN)
         btn_frame.pack(anchor="w", padx=25, pady=5)
 
-        def run_in_thread(func, label):
-            self._log(log, f"Starting: {label}...")
-
-            def task():
-                import io
-                from contextlib import redirect_stdout
-                f = io.StringIO()
-                with redirect_stdout(f):
-                    func()
-                output = f.getvalue()
-                for line in output.splitlines():
-                    if line.strip():
-                        self._log(log, line)
-                self._log(log, f"✓ {label} complete.")
-
-            threading.Thread(target=task, daemon=True).start()
-
         btns = [
-            ("Send Awareness Tip", GREEN,  lambda: run_in_thread(broadcast_awareness, "Awareness blast")),
-            ("Broadcast Alerts",   RED,    lambda: run_in_thread(broadcast_alerts,   "Alert broadcast")),
+            ("Send Awareness Tip",   GREEN,  broadcast_awareness, "Awareness blast"),
+            ("Broadcast Alerts",     RED,    broadcast_alerts,    "Alert broadcast"),
+            ("Full Daily Broadcast", PURPLE, daily_broadcast,     "Full daily broadcast"),
         ]
-        for text, color, cmd in btns:
+        for text, color, func, label in btns:
             tk.Button(btn_frame, text=f"  {text}  ",
                       font=(FONT, 11, "bold"), fg=WHITE, bg=color,
                       relief="flat", padx=15, pady=8, cursor="hand2",
-                      command=cmd).pack(side="left", padx=5)
+                      command=lambda f=func, l=label: self._run_broadcast(f, l)
+                      ).pack(side="left", padx=5)
+
+        # When opened from a Dashboard quick action, start that job immediately.
+        if auto:
+            func, label = auto
+            self._run_broadcast(func, label)
+
+    def _run_broadcast(self, func, label):
+        """Run a broadcast off the UI thread, capturing its console output into
+        the send log. Tkinter is not thread-safe, so every widget update is
+        marshalled back to the main thread via root.after()."""
+        log = self._send_log
+        self._log(log, f"Starting: {label}...")
+
+        def task():
+            import io
+            from contextlib import redirect_stdout
+            f = io.StringIO()
+            try:
+                with redirect_stdout(f):
+                    func()
+                done, color = f"✓ {label} complete.", GREEN
+            except Exception as e:
+                done, color = f"✗ {label} failed: {e}", RED
+            lines = [ln for ln in f.getvalue().splitlines() if ln.strip()]
+
+            def flush():
+                for line in lines:
+                    self._log(log, line)
+                self._log(log, done, color)
+            self._ui(flush)
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _send_awareness_now(self):
-        self._show_send()
+        self._show_send(auto=(broadcast_awareness, "Awareness blast"))
 
     def _send_alerts_now(self):
-        self._show_send()
+        self._show_send(auto=(broadcast_alerts, "Alert broadcast"))
 
     def _send_full_now(self):
-        self._show_send()
+        self._show_send(auto=(daily_broadcast, "Full daily broadcast"))
 
     # ══════════════════════════════════════════════════════════
     #  STATISTICS

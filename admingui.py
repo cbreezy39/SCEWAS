@@ -185,6 +185,10 @@ class AdminGUI:
                  ).pack(anchor="w", padx=25, pady=(15, 5))
 
     def _log(self, widget, message, color=None):
+        # The widget may already be destroyed if the operator navigated to
+        # another page before a background broadcast finished writing to it.
+        if not widget.winfo_exists():
+            return
         widget.config(state="normal")
         line = f"[{datetime.datetime.now().strftime('%H:%M:%S')}]  {message}\n"
         if color:

@@ -503,7 +503,8 @@ class AdminGUI:
         self._page_title("Create Early Warning Alert",
                          "Alert will be broadcast immediately to all participants")
 
-        form = tk.Frame(self.content, bg=BG_CARD)
+        body = self._scrollable_body(self.content)
+        form = tk.Frame(body, bg=BG_CARD)
         form.pack(padx=25, pady=10, fill="x")
 
         # Category

@@ -414,6 +414,35 @@ class AdminGUI:
             entry.insert(0, placeholder)
             entry.config(fg=DGRAY)
 
+    # ── HELPER: vertically scrollable body ─────────────────────
+    def _scrollable_body(self, parent):
+        """Return an inner frame inside a vertically scrolling canvas that fills
+        `parent`. Pack content into the returned frame — the canvas scrolls when
+        the content grows past the visible height."""
+        canvas = tk.Canvas(parent, bg=BG_MAIN, highlightthickness=0)
+        vbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=BG_MAIN)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+
+        # Keep the scroll region matched to the content height, and make the
+        # inner frame track the canvas width so cards fill the row.
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(window, width=e.width))
+
+        # Mouse-wheel scrolling, active only while the pointer is over the canvas.
+        def _wheel(e):
+            if canvas.winfo_exists():
+                canvas.yview_scroll(int(-e.delta / 120), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return inner
+
     # ══════════════════════════════════════════════════════════
     #  ACTIVE ALERTS
     # ══════════════════════════════════════════════════════════
@@ -430,8 +459,9 @@ class AdminGUI:
                      ).pack(pady=40)
             return
 
+        body = self._scrollable_body(self.content)
         for alert in alerts:
-            card = tk.Frame(self.content, bg=BG_CARD)
+            card = tk.Frame(body, bg=BG_CARD)
             card.pack(fill="x", padx=25, pady=6)
 
             # Severity colour
@@ -473,7 +503,8 @@ class AdminGUI:
         self._page_title("Create Early Warning Alert",
                          "Alert will be broadcast immediately to all participants")
 
-        form = tk.Frame(self.content, bg=BG_CARD)
+        body = self._scrollable_body(self.content)
+        form = tk.Frame(body, bg=BG_CARD)
         form.pack(padx=25, pady=10, fill="x")
 
         # Category

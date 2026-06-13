@@ -31,9 +31,11 @@ from modules.database import (
     add_alert, get_active_alerts, list_all_alerts,
     resolve_alert, get_send_stats, get_next_tip
 )
+from apscheduler.schedulers.background import BackgroundScheduler
 from modules.broadcaster import broadcast_alerts, broadcast_awareness, daily_broadcast
 from modules.sms_sender import validate_phone
-from config import TEST_MODE, SMS_PROVIDER, TEST_TARGET
+from config import (TEST_MODE, SMS_PROVIDER, TEST_TARGET,
+                    AWARENESS_FREQUENCY, AWARENESS_HOUR, AWARENESS_MINUTE)
 
 # ── COLOURS ───────────────────────────────────────────────────
 BG_MAIN    = "#1C2B3A"   # dark navy background
@@ -48,6 +50,29 @@ WHITE      = "#FFFFFF"
 LGRAY      = "#B0BEC5"
 DGRAY      = "#546E7A"
 FONT       = "Segoe UI"
+
+
+class _LineStream:
+    """A minimal file-like object that buffers writes and hands each COMPLETE
+    line to `emit` as it arrives. Used to stream a broadcast's stdout into the
+    GUI log live. `emit` is responsible for thread-safety (we route it through
+    the GUI's _ui queue), so this object itself can be written from any thread."""
+
+    def __init__(self, emit):
+        self._emit = emit
+        self._buf = ""
+
+    def write(self, text):
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._emit(line)
+
+    def flush(self):
+        if self._buf.strip():
+            self._emit(self._buf)
+        self._buf = ""
 
 
 class AdminGUI:
@@ -67,10 +92,26 @@ class AdminGUI:
         self._ui_queue = queue.Queue()
         self._poll_ui_queue()
 
+        # In-app scheduler (non-blocking, unlike scheduler.py's BlockingScheduler).
+        # Runs jobs on background threads; only fires while this window is open.
+        self._scheduler = BackgroundScheduler()
+        self._scheduler.start()
+        self._sched_log = None
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # Build UI
         self._build_header()
         self._build_layout()
         self._show_dashboard()
+
+    def _on_close(self):
+        """Shut the scheduler down cleanly before the window is destroyed."""
+        try:
+            if self._scheduler.running:
+                self._scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        self.root.destroy()
 
     # ── THREAD-SAFE UI BRIDGE ──────────────────────────────────
     def _ui(self, fn):
@@ -137,6 +178,7 @@ class AdminGUI:
             ("Active Alerts",    self._show_alerts),
             ("Create Alert",     self._show_create_alert),
             ("Send Blast",       self._show_send),
+            ("Scheduler",        self._show_scheduler),
             ("Statistics",       self._show_stats),
         ]
         for label, command in nav_items:
@@ -683,6 +725,153 @@ class AdminGUI:
 
     def _send_full_now(self):
         self._show_send(auto=(daily_broadcast, "Full daily broadcast"))
+
+    # ══════════════════════════════════════════════════════════
+    #  SCHEDULER
+    # ══════════════════════════════════════════════════════════
+    DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday",
+            "Friday", "Saturday", "Sunday"]
+
+    def _show_scheduler(self):
+        self._clear()
+        self._page_title("Scheduler",
+                         "Automate the daily broadcast (alerts + awareness tip)")
+
+        form = tk.Frame(self.content, bg=BG_CARD)
+        form.pack(padx=25, pady=10, fill="x")
+
+        # Frequency: Daily / Weekly
+        freq_row = tk.Frame(form, bg=BG_CARD)
+        freq_row.pack(fill="x", padx=20, pady=(12, 6))
+        tk.Label(freq_row, text="Frequency", font=(FONT, 10, "bold"),
+                 fg=WHITE, bg=BG_CARD, width=12, anchor="w").pack(side="left")
+        freq_var = tk.StringVar(value=AWARENESS_FREQUENCY if AWARENESS_FREQUENCY in ("daily", "weekly") else "daily")
+        day_combo = ttk.Combobox(freq_row, values=self.DAYS, state="readonly",
+                                 width=12, font=(FONT, 10))
+        day_combo.set("Monday")
+
+        def _toggle_day(*_):
+            day_combo.configure(state="readonly" if freq_var.get() == "weekly" else "disabled")
+        for val in ("daily", "weekly"):
+            tk.Radiobutton(freq_row, text=val.capitalize(), variable=freq_var,
+                           value=val, command=_toggle_day,
+                           font=(FONT, 10), fg=WHITE, bg=BG_CARD,
+                           selectcolor=BG_CARD, activebackground=BG_CARD
+                           ).pack(side="left", padx=8)
+        tk.Label(freq_row, text="  Day:", font=(FONT, 10),
+                 fg=LGRAY, bg=BG_CARD).pack(side="left", padx=(10, 4))
+        day_combo.pack(side="left")
+
+        # Time of day
+        time_row = tk.Frame(form, bg=BG_CARD)
+        time_row.pack(fill="x", padx=20, pady=6)
+        tk.Label(time_row, text="Time", font=(FONT, 10, "bold"),
+                 fg=WHITE, bg=BG_CARD, width=12, anchor="w").pack(side="left")
+        hour_var   = tk.StringVar(value=f"{AWARENESS_HOUR:02d}")
+        minute_var = tk.StringVar(value=f"{AWARENESS_MINUTE:02d}")
+        tk.Spinbox(time_row, from_=0, to=23, wrap=True, width=4, format="%02.0f",
+                   textvariable=hour_var, font=(FONT, 11), justify="center"
+                   ).pack(side="left")
+        tk.Label(time_row, text=":", font=(FONT, 12, "bold"),
+                 fg=WHITE, bg=BG_CARD).pack(side="left", padx=4)
+        tk.Spinbox(time_row, from_=0, to=59, wrap=True, width=4, format="%02.0f",
+                   textvariable=minute_var, font=(FONT, 11), justify="center"
+                   ).pack(side="left")
+        tk.Label(time_row, text="  (24-hour)", font=(FONT, 8),
+                 fg=DGRAY, bg=BG_CARD).pack(side="left", padx=6)
+
+        # Start / Stop + Run now
+        btn_row = tk.Frame(form, bg=BG_CARD)
+        btn_row.pack(fill="x", padx=20, pady=(8, 6))
+        tk.Button(btn_row, text="  Start Schedule  ", font=(FONT, 10, "bold"),
+                  fg=WHITE, bg=GREEN, relief="flat", padx=12, pady=6, cursor="hand2",
+                  command=lambda: self._scheduler_start(freq_var, hour_var, minute_var, day_combo)
+                  ).pack(side="left", padx=4)
+        tk.Button(btn_row, text="  Stop Schedule  ", font=(FONT, 10, "bold"),
+                  fg=WHITE, bg=RED, relief="flat", padx=12, pady=6, cursor="hand2",
+                  command=self._scheduler_stop).pack(side="left", padx=4)
+        tk.Button(btn_row, text="  Run Now  ", font=(FONT, 10, "bold"),
+                  fg=WHITE, bg=PURPLE, relief="flat", padx=12, pady=6, cursor="hand2",
+                  command=lambda: threading.Thread(target=self._run_scheduled,
+                                                    daemon=True).start()
+                  ).pack(side="left", padx=4)
+
+        self._next_lbl = tk.Label(form, text="", font=(FONT, 10, "bold"),
+                                  fg=GOLD, bg=BG_CARD)
+        self._next_lbl.pack(anchor="w", padx=20, pady=(0, 12))
+
+        # Live activity log
+        self._section("Live Broadcast Activity")
+        self._sched_log = scrolledtext.ScrolledText(
+            self.content, height=12, bg=BG_CARD, fg=GREEN,
+            font=("Courier New", 9), state="disabled", relief="flat"
+        )
+        self._sched_log.pack(fill="both", expand=True, padx=25, pady=(5, 15))
+
+        _toggle_day()
+        self._update_next_run()
+
+    def _scheduler_start(self, freq_var, hour_var, minute_var, day_combo):
+        try:
+            hh, mm = int(hour_var.get()), int(minute_var.get())
+            assert 0 <= hh <= 23 and 0 <= mm <= 59
+        except (ValueError, AssertionError):
+            self._log(self._sched_log, "Invalid time — hour 0–23, minute 0–59.", RED)
+            return
+
+        freq = freq_var.get()
+        kwargs = dict(hour=hh, minute=mm)
+        if freq == "weekly":
+            kwargs["day_of_week"] = day_combo.get()[:3].lower()
+            when = f"{day_combo.get()} at {hh:02d}:{mm:02d}"
+        else:
+            when = f"daily at {hh:02d}:{mm:02d}"
+
+        self._scheduler.add_job(self._run_scheduled, "cron",
+                                id="gui_broadcast", replace_existing=True, **kwargs)
+        self._log(self._sched_log, f"Schedule started — {when}.", GREEN)
+        self._update_next_run()
+
+    def _scheduler_stop(self):
+        if self._scheduler.get_job("gui_broadcast"):
+            self._scheduler.remove_job("gui_broadcast")
+            self._log(self._sched_log, "Schedule stopped.", ORANGE)
+        else:
+            self._log(self._sched_log, "No active schedule.", LGRAY)
+        self._update_next_run()
+
+    def _update_next_run(self):
+        if not (self._next_lbl and self._next_lbl.winfo_exists()):
+            return
+        job = self._scheduler.get_job("gui_broadcast")
+        if job and job.next_run_time:
+            self._next_lbl.config(
+                text=f"Next run: {job.next_run_time.strftime('%a %d %b %Y  %H:%M')}",
+                fg=GOLD)
+        else:
+            self._next_lbl.config(text="Next run: — (not scheduled)", fg=DGRAY)
+
+    def _run_scheduled(self):
+        """Runs daily_broadcast, streaming its output live into the scheduler
+        log. Invoked from a scheduler/worker thread, so every UI touch goes
+        through the _ui queue, and the log is written line-by-line as it prints."""
+        from contextlib import redirect_stdout
+
+        emit = lambda line: self._ui(lambda l=line: self._log(self._sched_log, l))
+        self._ui(lambda: self._log(self._sched_log,
+                                   "── Broadcast starting ──", GOLD))
+        stream = _LineStream(emit)
+        try:
+            with redirect_stdout(stream):
+                daily_broadcast()
+            stream.flush()
+            self._ui(lambda: self._log(self._sched_log,
+                                       "✓ Broadcast complete.", GREEN))
+        except Exception as e:
+            stream.flush()
+            self._ui(lambda e=e: self._log(self._sched_log,
+                                           f"✗ Broadcast failed: {e}", RED))
+        self._ui(self._update_next_run)
 
     # ══════════════════════════════════════════════════════════
     #  STATISTICS

@@ -29,11 +29,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from modules.database import (
     create_tables, add_user, get_active_users,
     add_alert, get_active_alerts, list_all_alerts,
-    resolve_alert, get_send_stats, get_next_tip
+    resolve_alert, get_send_stats, get_next_tip,
+    add_tip, get_all_tips, update_tip, delete_tip
 )
+from apscheduler.schedulers.background import BackgroundScheduler
 from modules.broadcaster import broadcast_alerts, broadcast_awareness, daily_broadcast
 from modules.sms_sender import validate_phone
-from config import TEST_MODE, SMS_PROVIDER, TEST_TARGET
+from config import (TEST_MODE, SMS_PROVIDER, TEST_TARGET,
+                    AWARENESS_FREQUENCY, AWARENESS_HOUR, AWARENESS_MINUTE)
 
 # ── COLOURS ───────────────────────────────────────────────────
 BG_MAIN    = "#1C2B3A"   # dark navy background
@@ -48,6 +51,29 @@ WHITE      = "#FFFFFF"
 LGRAY      = "#B0BEC5"
 DGRAY      = "#546E7A"
 FONT       = "Segoe UI"
+
+
+class _LineStream:
+    """A minimal file-like object that buffers writes and hands each COMPLETE
+    line to `emit` as it arrives. Used to stream a broadcast's stdout into the
+    GUI log live. `emit` is responsible for thread-safety (we route it through
+    the GUI's _ui queue), so this object itself can be written from any thread."""
+
+    def __init__(self, emit):
+        self._emit = emit
+        self._buf = ""
+
+    def write(self, text):
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._emit(line)
+
+    def flush(self):
+        if self._buf.strip():
+            self._emit(self._buf)
+        self._buf = ""
 
 
 class AdminGUI:
@@ -67,10 +93,26 @@ class AdminGUI:
         self._ui_queue = queue.Queue()
         self._poll_ui_queue()
 
+        # In-app scheduler (non-blocking, unlike scheduler.py's BlockingScheduler).
+        # Runs jobs on background threads; only fires while this window is open.
+        self._scheduler = BackgroundScheduler()
+        self._scheduler.start()
+        self._sched_log = None
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # Build UI
         self._build_header()
         self._build_layout()
         self._show_dashboard()
+
+    def _on_close(self):
+        """Shut the scheduler down cleanly before the window is destroyed."""
+        try:
+            if self._scheduler.running:
+                self._scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        self.root.destroy()
 
     # ── THREAD-SAFE UI BRIDGE ──────────────────────────────────
     def _ui(self, fn):
@@ -136,7 +178,10 @@ class AdminGUI:
             ("Register New",     self._show_register),
             ("Active Alerts",    self._show_alerts),
             ("Create Alert",     self._show_create_alert),
+            ("Awareness Tips",   self._show_tips),
+            ("Create Tip",       self._show_create_tip),
             ("Send Blast",       self._show_send),
+            ("Scheduler",        self._show_scheduler),
             ("Statistics",       self._show_stats),
         ]
         for label, command in nav_items:
@@ -613,6 +658,176 @@ class AdminGUI:
                   command=create).pack(pady=15, padx=20, anchor="w")
 
     # ══════════════════════════════════════════════════════════
+    #  AWARENESS TIPS  (list + delete; edit opens Create Tip)
+    # ══════════════════════════════════════════════════════════
+    TIP_CATEGORIES = ["mobile_money", "smishing", "verification",
+                      "reporting", "phishing", "vishing", "general"]
+
+    def _show_tips(self):
+        self._clear()
+        self._page_title("Awareness Tips",
+                         "Tips rotate through the daily awareness broadcast (least-sent first)")
+
+        tips = get_all_tips()
+        if not tips:
+            tk.Label(self.content,
+                     text="No tips yet — use 'Create Tip' to add one.",
+                     font=(FONT, 12), fg=LGRAY, bg=BG_MAIN).pack(pady=40)
+            return
+
+        body = self._scrollable_body(self.content)
+        for tip in tips:
+            card = tk.Frame(body, bg=BG_CARD)
+            card.pack(fill="x", padx=25, pady=6)
+
+            header = tk.Frame(card, bg=PURPLE)
+            header.pack(fill="x")
+            tk.Label(header,
+                     text=f"  {tip['category'].upper()}  — Tip ID: {tip['id']}",
+                     font=(FONT, 10, "bold"), fg=WHITE, bg=PURPLE
+                     ).pack(side="left", padx=10, pady=6)
+            tk.Label(header, text=f"sent {tip['sent_count']}×  ",
+                     font=(FONT, 9), fg=WHITE, bg=PURPLE).pack(side="right", pady=6)
+
+            tk.Label(card, text=tip["english"],
+                     font=(FONT, 9), fg=WHITE, bg=BG_CARD,
+                     wraplength=700, justify="left"
+                     ).pack(anchor="w", padx=15, pady=8)
+
+            langs = [l for l in ("bemba", "nyanja") if (tip[l] or "").strip()]
+            tk.Label(card,
+                     text="Translations: " + (", ".join(langs) if langs else "English only"),
+                     font=(FONT, 8), fg=DGRAY, bg=BG_CARD
+                     ).pack(anchor="w", padx=15, pady=(0, 5))
+
+            actions = tk.Frame(card, bg=BG_CARD)
+            actions.pack(anchor="e", padx=15, pady=8)
+            tk.Button(actions, text="Edit", font=(FONT, 9), fg=WHITE, bg=DGRAY,
+                      relief="flat", padx=10, pady=4, cursor="hand2",
+                      command=lambda t=dict(tip): self._show_create_tip(t)
+                      ).pack(side="left", padx=4)
+            tk.Button(actions, text="Delete", font=(FONT, 9), fg=WHITE, bg=RED,
+                      relief="flat", padx=10, pady=4, cursor="hand2",
+                      command=lambda tid=tip["id"]: self._delete_tip(tid)
+                      ).pack(side="left", padx=4)
+
+    def _delete_tip(self, tip_id):
+        if messagebox.askyesno("Delete Tip",
+                               f"Delete Tip {tip_id}? This removes it from the "
+                               f"awareness rotation permanently."):
+            try:
+                delete_tip(tip_id)
+            except Exception as e:
+                messagebox.showerror("Delete failed", str(e))
+            self._show_tips()
+
+    # ══════════════════════════════════════════════════════════
+    #  CREATE / EDIT TIP
+    # ══════════════════════════════════════════════════════════
+    def _show_create_tip(self, tip=None):
+        """Create a new awareness tip, or edit an existing one if `tip` (a dict)
+        is passed in from the Awareness Tips list."""
+        editing = tip is not None
+        self._clear()
+        self._page_title("Edit Tip" if editing else "Create Awareness Tip",
+                         "Added tips join the daily awareness rotation automatically")
+
+        body = self._scrollable_body(self.content)
+        form = tk.Frame(body, bg=BG_CARD)
+        form.pack(padx=25, pady=10, fill="x")
+
+        # Category (editable combobox — suggestions, but custom allowed)
+        cat_row = tk.Frame(form, bg=BG_CARD)
+        cat_row.pack(fill="x", padx=20, pady=8)
+        tk.Label(cat_row, text="Category", font=(FONT, 10, "bold"),
+                 fg=WHITE, bg=BG_CARD, width=12, anchor="w").pack(side="left")
+        cat_var = tk.StringVar(value=tip["category"] if editing else "general")
+        ttk.Combobox(cat_row, textvariable=cat_var, values=self.TIP_CATEGORIES,
+                     width=30, font=(FONT, 10)).pack(side="left", padx=10, ipady=4)
+
+        # English (required)
+        tk.Label(form, text="Tip Message (English)",
+                 font=(FONT, 10, "bold"), fg=WHITE, bg=BG_CARD
+                 ).pack(anchor="w", padx=20, pady=(10, 2))
+        msg_box = tk.Text(form, height=3, font=(FONT, 10),
+                          bg="#2C4158", fg=WHITE, insertbackground=WHITE,
+                          relief="flat", wrap="word")
+        msg_box.pack(fill="x", padx=20, pady=4, ipady=4)
+        if editing:
+            msg_box.insert("1.0", tip["english"])
+
+        char_label = tk.Label(form, text="0 / 160 characters",
+                              font=(FONT, 8), fg=LGRAY, bg=BG_CARD)
+        char_label.pack(anchor="e", padx=20)
+
+        def update_char(event=None):
+            count = len(msg_box.get("1.0", "end-1c"))
+            char_label.config(text=f"{count} / 160 characters",
+                              fg=RED if count > 160 else LGRAY)
+        msg_box.bind("<KeyRelease>", update_char)
+
+        # Optional translations
+        tk.Label(form, text="Bemba Translation (optional)",
+                 font=(FONT, 9), fg=LGRAY, bg=BG_CARD
+                 ).pack(anchor="w", padx=20, pady=(10, 2))
+        bemba_box = tk.Text(form, height=2, font=(FONT, 10),
+                            bg="#2C4158", fg=WHITE, insertbackground=WHITE,
+                            relief="flat", wrap="word")
+        bemba_box.pack(fill="x", padx=20, pady=4, ipady=4)
+
+        tk.Label(form, text="Nyanja Translation (optional)",
+                 font=(FONT, 9), fg=LGRAY, bg=BG_CARD
+                 ).pack(anchor="w", padx=20, pady=(8, 2))
+        nyanja_box = tk.Text(form, height=2, font=(FONT, 10),
+                             bg="#2C4158", fg=WHITE, insertbackground=WHITE,
+                             relief="flat", wrap="word")
+        nyanja_box.pack(fill="x", padx=20, pady=4, ipady=4)
+        if editing:
+            bemba_box.insert("1.0", tip["bemba"] or "")
+            nyanja_box.insert("1.0", tip["nyanja"] or "")
+
+        status = tk.Label(form, text="", font=(FONT, 10), bg=BG_CARD, fg=GREEN)
+        status.pack(pady=5)
+        update_char()
+
+        def save():
+            english = msg_box.get("1.0", "end-1c").strip()
+            bemba   = bemba_box.get("1.0", "end-1c").strip()
+            nyanja  = nyanja_box.get("1.0", "end-1c").strip()
+            category = cat_var.get().strip() or "general"
+
+            if not english:
+                status.config(text="Tip message cannot be empty.", fg=RED)
+                return
+            try:
+                if editing:
+                    update_tip(tip["id"], category, english, bemba, nyanja)
+                    msg = f"✓  Tip {tip['id']} updated."
+                else:
+                    add_tip(category, english, bemba, nyanja)
+                    msg = "✓  Tip created and added to the rotation."
+            except Exception as e:
+                status.config(text=f"Save failed: {e}", fg=RED)
+                return
+
+            status.config(text=msg, fg=GREEN)
+            if not editing:                      # clear so the next tip can be added
+                msg_box.delete("1.0", "end"); bemba_box.delete("1.0", "end")
+                nyanja_box.delete("1.0", "end"); cat_var.set("general")
+                update_char()
+
+        tk.Button(form, text="  Save Tip  " if editing else "  Create Tip  ",
+                  font=(FONT, 11, "bold"), fg=WHITE, bg=PURPLE,
+                  relief="flat", padx=15, pady=8, cursor="hand2",
+                  command=save).pack(pady=15, padx=20, anchor="w")
+
+        if editing:
+            tk.Button(form, text="  Back to Tips  ", font=(FONT, 9),
+                      fg=WHITE, bg=DGRAY, relief="flat", padx=10, pady=5,
+                      cursor="hand2", command=self._show_tips
+                      ).pack(padx=20, pady=(0, 12), anchor="w")
+
+    # ══════════════════════════════════════════════════════════
     #  SEND BLAST
     # ══════════════════════════════════════════════════════════
     def _show_send(self, auto=None):
@@ -683,6 +898,153 @@ class AdminGUI:
 
     def _send_full_now(self):
         self._show_send(auto=(daily_broadcast, "Full daily broadcast"))
+
+    # ══════════════════════════════════════════════════════════
+    #  SCHEDULER
+    # ══════════════════════════════════════════════════════════
+    DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday",
+            "Friday", "Saturday", "Sunday"]
+
+    def _show_scheduler(self):
+        self._clear()
+        self._page_title("Scheduler",
+                         "Automate the daily broadcast (alerts + awareness tip)")
+
+        form = tk.Frame(self.content, bg=BG_CARD)
+        form.pack(padx=25, pady=10, fill="x")
+
+        # Frequency: Daily / Weekly
+        freq_row = tk.Frame(form, bg=BG_CARD)
+        freq_row.pack(fill="x", padx=20, pady=(12, 6))
+        tk.Label(freq_row, text="Frequency", font=(FONT, 10, "bold"),
+                 fg=WHITE, bg=BG_CARD, width=12, anchor="w").pack(side="left")
+        freq_var = tk.StringVar(value=AWARENESS_FREQUENCY if AWARENESS_FREQUENCY in ("daily", "weekly") else "daily")
+        day_combo = ttk.Combobox(freq_row, values=self.DAYS, state="readonly",
+                                 width=12, font=(FONT, 10))
+        day_combo.set("Monday")
+
+        def _toggle_day(*_):
+            day_combo.configure(state="readonly" if freq_var.get() == "weekly" else "disabled")
+        for val in ("daily", "weekly"):
+            tk.Radiobutton(freq_row, text=val.capitalize(), variable=freq_var,
+                           value=val, command=_toggle_day,
+                           font=(FONT, 10), fg=WHITE, bg=BG_CARD,
+                           selectcolor=BG_CARD, activebackground=BG_CARD
+                           ).pack(side="left", padx=8)
+        tk.Label(freq_row, text="  Day:", font=(FONT, 10),
+                 fg=LGRAY, bg=BG_CARD).pack(side="left", padx=(10, 4))
+        day_combo.pack(side="left")
+
+        # Time of day
+        time_row = tk.Frame(form, bg=BG_CARD)
+        time_row.pack(fill="x", padx=20, pady=6)
+        tk.Label(time_row, text="Time", font=(FONT, 10, "bold"),
+                 fg=WHITE, bg=BG_CARD, width=12, anchor="w").pack(side="left")
+        hour_var   = tk.StringVar(value=f"{AWARENESS_HOUR:02d}")
+        minute_var = tk.StringVar(value=f"{AWARENESS_MINUTE:02d}")
+        tk.Spinbox(time_row, from_=0, to=23, wrap=True, width=4, format="%02.0f",
+                   textvariable=hour_var, font=(FONT, 11), justify="center"
+                   ).pack(side="left")
+        tk.Label(time_row, text=":", font=(FONT, 12, "bold"),
+                 fg=WHITE, bg=BG_CARD).pack(side="left", padx=4)
+        tk.Spinbox(time_row, from_=0, to=59, wrap=True, width=4, format="%02.0f",
+                   textvariable=minute_var, font=(FONT, 11), justify="center"
+                   ).pack(side="left")
+        tk.Label(time_row, text="  (24-hour)", font=(FONT, 8),
+                 fg=DGRAY, bg=BG_CARD).pack(side="left", padx=6)
+
+        # Start / Stop + Run now
+        btn_row = tk.Frame(form, bg=BG_CARD)
+        btn_row.pack(fill="x", padx=20, pady=(8, 6))
+        tk.Button(btn_row, text="  Start Schedule  ", font=(FONT, 10, "bold"),
+                  fg=WHITE, bg=GREEN, relief="flat", padx=12, pady=6, cursor="hand2",
+                  command=lambda: self._scheduler_start(freq_var, hour_var, minute_var, day_combo)
+                  ).pack(side="left", padx=4)
+        tk.Button(btn_row, text="  Stop Schedule  ", font=(FONT, 10, "bold"),
+                  fg=WHITE, bg=RED, relief="flat", padx=12, pady=6, cursor="hand2",
+                  command=self._scheduler_stop).pack(side="left", padx=4)
+        tk.Button(btn_row, text="  Run Now  ", font=(FONT, 10, "bold"),
+                  fg=WHITE, bg=PURPLE, relief="flat", padx=12, pady=6, cursor="hand2",
+                  command=lambda: threading.Thread(target=self._run_scheduled,
+                                                    daemon=True).start()
+                  ).pack(side="left", padx=4)
+
+        self._next_lbl = tk.Label(form, text="", font=(FONT, 10, "bold"),
+                                  fg=GOLD, bg=BG_CARD)
+        self._next_lbl.pack(anchor="w", padx=20, pady=(0, 12))
+
+        # Live activity log
+        self._section("Live Broadcast Activity")
+        self._sched_log = scrolledtext.ScrolledText(
+            self.content, height=12, bg=BG_CARD, fg=GREEN,
+            font=("Courier New", 9), state="disabled", relief="flat"
+        )
+        self._sched_log.pack(fill="both", expand=True, padx=25, pady=(5, 15))
+
+        _toggle_day()
+        self._update_next_run()
+
+    def _scheduler_start(self, freq_var, hour_var, minute_var, day_combo):
+        try:
+            hh, mm = int(hour_var.get()), int(minute_var.get())
+            assert 0 <= hh <= 23 and 0 <= mm <= 59
+        except (ValueError, AssertionError):
+            self._log(self._sched_log, "Invalid time — hour 0–23, minute 0–59.", RED)
+            return
+
+        freq = freq_var.get()
+        kwargs = dict(hour=hh, minute=mm)
+        if freq == "weekly":
+            kwargs["day_of_week"] = day_combo.get()[:3].lower()
+            when = f"{day_combo.get()} at {hh:02d}:{mm:02d}"
+        else:
+            when = f"daily at {hh:02d}:{mm:02d}"
+
+        self._scheduler.add_job(self._run_scheduled, "cron",
+                                id="gui_broadcast", replace_existing=True, **kwargs)
+        self._log(self._sched_log, f"Schedule started — {when}.", GREEN)
+        self._update_next_run()
+
+    def _scheduler_stop(self):
+        if self._scheduler.get_job("gui_broadcast"):
+            self._scheduler.remove_job("gui_broadcast")
+            self._log(self._sched_log, "Schedule stopped.", ORANGE)
+        else:
+            self._log(self._sched_log, "No active schedule.", LGRAY)
+        self._update_next_run()
+
+    def _update_next_run(self):
+        if not (self._next_lbl and self._next_lbl.winfo_exists()):
+            return
+        job = self._scheduler.get_job("gui_broadcast")
+        if job and job.next_run_time:
+            self._next_lbl.config(
+                text=f"Next run: {job.next_run_time.strftime('%a %d %b %Y  %H:%M')}",
+                fg=GOLD)
+        else:
+            self._next_lbl.config(text="Next run: — (not scheduled)", fg=DGRAY)
+
+    def _run_scheduled(self):
+        """Runs daily_broadcast, streaming its output live into the scheduler
+        log. Invoked from a scheduler/worker thread, so every UI touch goes
+        through the _ui queue, and the log is written line-by-line as it prints."""
+        from contextlib import redirect_stdout
+
+        emit = lambda line: self._ui(lambda l=line: self._log(self._sched_log, l))
+        self._ui(lambda: self._log(self._sched_log,
+                                   "── Broadcast starting ──", GOLD))
+        stream = _LineStream(emit)
+        try:
+            with redirect_stdout(stream):
+                daily_broadcast()
+            stream.flush()
+            self._ui(lambda: self._log(self._sched_log,
+                                       "✓ Broadcast complete.", GREEN))
+        except Exception as e:
+            stream.flush()
+            self._ui(lambda e=e: self._log(self._sched_log,
+                                           f"✗ Broadcast failed: {e}", RED))
+        self._ui(self._update_next_run)
 
     # ══════════════════════════════════════════════════════════
     #  STATISTICS

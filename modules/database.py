@@ -195,6 +195,33 @@ def mark_tip_sent(tip_id):
     conn.close()
 
 
+def get_all_tips():
+    """Return every tip, grouped by category then insertion order."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tips ORDER BY category ASC, id ASC"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def update_tip(tip_id, category, english, bemba="", nyanja=""):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE tips SET category = ?, english = ?, bemba = ?, nyanja = ? WHERE id = ?",
+        (category, english, bemba, nyanja, tip_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_tip(tip_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM tips WHERE id = ?", (tip_id,))
+    conn.commit()
+    conn.close()
+
+
 # ── ALERT FUNCTIONS ───────────────────────────────────────────
 
 def add_alert(category, english, bemba="", nyanja="",
